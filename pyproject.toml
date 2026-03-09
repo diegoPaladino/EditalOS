@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "editalos"
+version = "0.1.0"
+description = "Assistente local de estudo para concursos com FSRS, SQLite, analytics e biohacking"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["editalos*"]

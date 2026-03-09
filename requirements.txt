@@ -1,0 +1,12 @@
+openai>=2.0.0
+SQLAlchemy>=2.0.30
+alembic>=1.13.2
+pydantic>=2.8.2
+pydantic-settings>=2.3.4
+python-dotenv>=1.0.1
+pypdf>=5.1.0
+pandas>=2.2.2
+numpy>=1.26.4
+streamlit>=1.37.0
+fsrs>=6.3.0
+sm-2>=0.3.0

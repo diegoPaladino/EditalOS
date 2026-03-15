@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from editalos.config import get_settings
 
@@ -13,12 +14,46 @@ class Base(DeclarativeBase):
 
 
 settings = get_settings()
-engine = create_engine(
-    settings.db_url,
-    echo=False,
-    future=True,
-)
+engine_kwargs: dict[str, object] = {
+    "echo": False,
+    "future": True,
+}
+if settings.db_url.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {
+        "check_same_thread": False,
+        "timeout": 30,
+    }
+    # SQLite local + Streamlit funciona melhor sem QueuePool.
+    engine_kwargs["poolclass"] = NullPool
+
+engine = create_engine(settings.db_url, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+
+def initialize_database() -> None:
+    Base.metadata.create_all(bind=engine)
+    if not settings.db_url.startswith("sqlite"):
+        return
+    _ensure_subject_planning_columns()
+
+
+def _ensure_subject_planning_columns() -> None:
+    inspector = inspect(engine)
+    if "subjects" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("subjects")}
+    statements: list[str] = []
+    if "planned_total_minutes" not in columns:
+        statements.append("ALTER TABLE subjects ADD COLUMN planned_total_minutes INTEGER")
+    if "planned_weekly_minutes" not in columns:
+        statements.append("ALTER TABLE subjects ADD COLUMN planned_weekly_minutes INTEGER")
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 @contextmanager

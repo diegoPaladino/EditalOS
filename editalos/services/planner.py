@@ -54,6 +54,7 @@ class PlannerService:
         forgetting = self._topic_forgetting_risk(topic.id)
         proximity = self._exam_proximity_multiplier()
         recent_errors = self._recent_error_multiplier(topic.id)
+        time_balance = self._subject_time_balance_multiplier(topic.subject_id)
 
         weights = self.config.weights
         score = (
@@ -63,6 +64,7 @@ class PlannerService:
             * (forgetting * weights.forgetting_factor)
             * (proximity * weights.exam_proximity_factor)
             * (recent_errors * weights.recent_errors_factor)
+            * time_balance
         )
         rationale = {
             "edital_weight": edital_weight,
@@ -71,6 +73,7 @@ class PlannerService:
             "forgetting": forgetting,
             "proximity": proximity,
             "recent_errors": recent_errors,
+            "time_balance": time_balance,
         }
         return score, rationale
 
@@ -113,6 +116,27 @@ class PlannerService:
         if recent_accuracy is None:
             return 1.0
         return max(1.0 + (0.7 - float(recent_accuracy)), 0.8)
+
+    def _subject_time_balance_multiplier(self, subject_id: int) -> float:
+        subject = self.session.get(Subject, subject_id)
+        if subject is None or not subject.planned_weekly_minutes or subject.planned_weekly_minutes <= 0:
+            return 1.0
+
+        since = datetime.now(UTC) - timedelta(days=7)
+        studied_minutes = int(
+            self.session.scalar(
+                select(func.coalesce(func.sum(StudySession.actual_minutes), 0)).where(
+                    StudySession.subject_id == subject_id,
+                    StudySession.started_at >= since,
+                )
+            )
+            or 0
+        )
+        target = max(int(subject.planned_weekly_minutes), 1)
+        ratio = studied_minutes / target
+        if ratio >= 1.0:
+            return max(0.85, 1.0 - min((ratio - 1.0) * 0.15, 0.15))
+        return min(1.35, 1.0 + ((1.0 - ratio) * 0.35))
 
     def _exam_proximity_multiplier(self) -> float:
         if self.config.exam_date is None:

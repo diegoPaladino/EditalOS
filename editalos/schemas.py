@@ -12,6 +12,8 @@ class SubjectCreate(BaseModel):
     name: str
     weight: float = 1.0
     question_count: int | None = None
+    planned_total_minutes: int | None = None
+    planned_weekly_minutes: int | None = None
     notes: str | None = None
 
 

@@ -19,7 +19,14 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from editalos.database import Base
-from editalos.enums import CardStatus, EntityType, SRSAlgorithm, StudyMaterialType
+from editalos.enums import (
+    CardStatus,
+    EntityType,
+    ReviewTaskStatus,
+    SRSAlgorithm,
+    StudyMaterialType,
+    StudySessionRunStatus,
+)
 
 
 class TimestampMixin:
@@ -38,6 +45,8 @@ class Subject(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     question_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    planned_total_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    planned_weekly_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     topics: Mapped[list[Topic]] = relationship(back_populates="subject", cascade="all, delete-orphan")
@@ -159,6 +168,54 @@ class StudySession(Base, TimestampMixin):
 
     subject: Mapped[Subject | None] = relationship(back_populates="study_sessions")
     topic: Mapped[Topic | None] = relationship(back_populates="study_sessions")
+
+
+class StudySessionRun(Base, TimestampMixin):
+    __tablename__ = "study_session_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False, index=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"), nullable=False, index=True)
+    study_session_id: Mapped[int | None] = mapped_column(ForeignKey("study_sessions.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, index=True, default=StudySessionRunStatus.IN_PROGRESS.value
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    last_resumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    accumulated_active_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_paused_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gross_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    net_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class ReviewTask(Base, TimestampMixin):
+    __tablename__ = "review_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False, index=True)
+    study_session_id: Mapped[int | None] = mapped_column(ForeignKey("study_sessions.id"), nullable=True, index=True)
+    study_session_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("study_session_runs.id"), nullable=True, index=True
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, index=True, default=ReviewTaskStatus.PENDING.value)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class TopicProgress(Base, TimestampMixin):
+    __tablename__ = "topic_progress"
+    __table_args__ = (UniqueConstraint("topic_id", name="uq_topic_progress_topic"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False, index=True)
+    total_sessions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_gross_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_net_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_reviews_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_studied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_review_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class QuestionAttempt(Base, TimestampMixin):

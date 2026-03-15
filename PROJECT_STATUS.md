@@ -1,49 +1,98 @@
-﻿# PROJECT_STATUS.md - EditalOS
+# PROJECT_STATUS.md - EditalOS
 
 ## Caminho local
 C:\Users\diego\Desktop\001-Desktop\programas\ProgramasCriadosPorMim\EditalOS\EditalOS
 
-## Estado atual validado
-- `.venv` criado e funcionando
-- dependencias instaladas por `requirements.txt`
-- banco SQLite criado: `editalos.db`
-- comando validado:
-  - `python -m editalos.cli init-db`
-- Streamlit funcionando com:
-  - `set PYTHONPATH=%CD%`
-  - `python -m streamlit run editalos/ui/streamlit_app.py`
+## Atualizacao deste status
+- Data de atualizacao: 2026-03-15
+- Base: leitura de `AGENTS.md`, `PROJECT_STATUS.md`, codigo atual e implementacao da sincronizacao de pesos/tempo por disciplina com integracao ao planejador.
 
-## Atualizacao relevante (2026-03-09)
-- Streamlit deixou de ser apenas dashboard e ganhou a primeira interface operacional.
-- Implementado formulario de cadastro de disciplina.
-- Implementado formulario de cadastro de topico vinculado a disciplina.
-- Interface exibe mensagens de sucesso/erro durante cadastro.
-- Tela atualiza automaticamente apos cadastro bem-sucedido.
-- Dashboard anterior foi preservado (metricas, plano diario, analytics e tabela de topicos).
+## Estado atual real do projeto
+- Estrutura principal em pacote `editalos` com camadas de CLI, services e UI Streamlit.
+- Banco SQLite local `editalos.db` presente e inicializavel via `python -m editalos.cli init-db`.
+- Streamlit em `editalos/ui/streamlit_app.py` agora esta orientado a execucao diaria (nao apenas cadastro/dashboard).
+- Caminho padrao do banco SQLite agora e absoluto para evitar abrir instancias apontando para arquivos `editalos.db` diferentes conforme o diretorio de execucao.
+- Engine SQLite ajustada para uso local com Streamlit sem `QueuePool`, reduzindo risco de `sqlalchemy.exc.TimeoutError` em reruns/conexoes concorrentes.
+- Inicializacao de schema no Streamlit agora e cacheada por processo, evitando repetir `create_all()` a cada rerun da interface.
+- `start_editalos.bat` simplificado para evitar a abertura de duas janelas do navegador.
+- Banco SQLite agora recebe migracao leve para novas colunas de planejamento em `subjects` (`planned_total_minutes`, `planned_weekly_minutes`) durante `init-db`/CLI/Streamlit.
 
-## Arquivos alterados na tarefa
-- `editalos/services/catalog.py` (novo)
-- `editalos/ui/streamlit_app.py`
-- `tests/test_catalog.py` (novo)
+## Fluxo operacional implementado no Streamlit
+- Sessao de estudo com controles: iniciar, pausar, retomar, finalizar.
+- Sessao vinculada a topico.
+- Registro de tempo bruto e liquido da sessao.
+- Ao finalizar sessao, geracao automatica de revisoes em D+1, D+7, D+15 e D+30.
+- Revisoes com status persistido: pendente, concluida, atrasada.
+- Acao na interface para marcar revisao como concluida.
+- Importacao em lote de topicos por disciplina com suporte a:
+- texto com um topico por linha
+- secao Markdown com bullets
+- CSV com cabecalho `Disciplina,Topico`
+- opcao para ignorar topicos ja existentes
+- Sincronizacao de pesos por disciplina via colagem de texto gerado por LLM.
+- Sincronizacao de metas de tempo por disciplina via colagem de texto gerado por LLM.
 
-## Validacao executada
-- `python -m py_compile editalos/services/catalog.py editalos/ui/streamlit_app.py tests/test_catalog.py` (ok)
-- `.venv\Scripts\python.exe -m py_compile editalos/services/catalog.py editalos/ui/streamlit_app.py` (ok)
-- Smoke test de persistencia em SQLite in-memory via `CatalogService` (ok)
-- `pytest` na `.venv` nao executou porque o pacote `pytest` nao esta instalado no ambiente
+## Painel operacional implementado
+- "O que estudar hoje" (plano diario via PlannerService).
+- Revisoes vencidas.
+- Proximas revisoes (janela de 30 dias).
+- Tempo estudado no dia (minutos).
+- Quantidade de revisoes concluidas no dia.
+- Tabela de disciplinas com peso, quantidade de questoes e metas total/semanal de tempo.
 
-## Situacao da interface
-- dashboard abre
-- exibe contadores e plano diario basico
-- possui formularios:
-  - cadastro de disciplina
-  - cadastro de topico
-- pendencias prioritarias:
-  - sessao de estudo com start/pause/finish
-  - logs de biohacking
-  - upload de PDF
+## Estrutura de dados operacional
+- Novos modelos/tabelas adicionados com compatibilidade SQLite:
+- `study_session_runs` (controle operacional de sessao: estado, pausas, bruto/liquido)
+- `review_tasks` (agenda de revisoes por topico)
+- `topic_progress` (acumulados por topico: sessoes, tempo, revisoes)
+- Tabela `study_sessions` existente foi preservada e continua sendo alimentada ao finalizar sessao.
 
-## Restricoes
-- tudo local
-- Windows
-- foco atual em robustez, nao em embalagem `.exe`
+## Compatibilidade e integridade
+- Cadastros existentes (disciplina/topico) preservados.
+- CLI validada e nao quebrada (`--help` e `init-db` funcionando).
+- Regras de negocio da nova operacao centralizadas em `services/`.
+- Novo comando CLI `import-topics` disponivel para importar topicos por arquivo, filtrando pela disciplina selecionada.
+- Novos comandos CLI `sync-subject-weights` e `sync-subject-time` disponiveis para sincronizacao por arquivo.
+- Planner agora considera metas semanais por disciplina como fator de balanceamento quando houver defasagem de estudo.
+
+## Snapshot atual do banco local (2026-03-10)
+- `subjects`: 2
+- `topics`: 0
+- `cards`: 0
+- `study_materials`: 0
+- `study_sessions`: 0
+- `study_session_runs`: 0
+- `review_tasks`: 0
+- `topic_progress`: 0
+- `sleep_logs`: 0
+- `hydration_logs`: 0
+- `nutrition_logs`: 0
+- `exercise_logs`: 0
+- `supplement_logs`: 0
+- `embedding_vectors`: 0
+
+## Handoff objetivo
+- Implementado: fase operacional de execucao de estudo + revisao espacada + painel diario.
+- Implementado: importacao em lote de topicos por disciplina na UI e na CLI.
+- Implementado: sincronizacao de pesos por disciplina e metas de tempo por disciplina na UI e na CLI.
+- Falta (proxima frente): logs de biohacking na interface Streamlit.
+
+## Validacao executada nesta atualizacao
+- `.venv\Scripts\python.exe -m py_compile editalos\database.py editalos\models.py editalos\schemas.py editalos\services\catalog.py editalos\services\planner.py editalos\cli.py editalos\ui\streamlit_app.py tests\test_catalog.py` (ok)
+- Smoke test SQLite in-memory para sincronizacao de pesos e tempo com atualizacao de `weight`, `planned_total_minutes` e `planned_weekly_minutes` (ok)
+- `.venv\Scripts\python.exe -m py_compile editalos\config.py editalos\database.py editalos\ui\streamlit_app.py` (pendente nesta etapa)
+- `.venv\Scripts\python.exe -m py_compile editalos\services\catalog.py editalos\ui\streamlit_app.py editalos\cli.py tests\test_catalog.py` (ok)
+- `.venv\Scripts\python.exe -m editalos.cli --help` (ok, `import-topics` listado)
+- Smoke test em memoria para `CatalogService.import_topics_for_subject` com Markdown e CSV, incluindo ignorar duplicados (ok)
+- `.venv\Scripts\python.exe -m pytest tests\test_catalog.py -q` nao executado nesta etapa (modulo `pytest` ausente na `.venv`)
+- `.venv\Scripts\python.exe -m py_compile editalos\enums.py editalos\models.py editalos\services\study_execution.py editalos\ui\streamlit_app.py tests\test_study_execution.py` (ok)
+- `.venv\Scripts\python.exe -m editalos.cli --help` (ok)
+- `.venv\Scripts\python.exe -m editalos.cli init-db` (ok)
+- Smoke test SQLite in-memory para sessao operacional + geracao de revisoes (ok)
+- `tests/test_study_execution.py` adicionado para cobrir regras de sessao/revisao/progresso
+- `.venv\Scripts\python.exe -m pytest -q` nao executado nesta etapa (modulo `pytest` ausente na `.venv`)
+
+## Restricoes atuais
+- execucao local Windows
+- banco local SQLite
+- sem empacotamento `.exe` nesta etapa

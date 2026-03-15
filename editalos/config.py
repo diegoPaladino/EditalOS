@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_DB_PATH = (ROOT_DIR / "editalos.db").resolve()
+DEFAULT_DB_URL = f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"
 
 
 class Settings(BaseSettings):
@@ -18,7 +20,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "EditalOS"
-    db_url: str = Field(default="sqlite:///editalos.db", alias="EDITALOS_DB_URL")
+    db_url: str = Field(default=DEFAULT_DB_URL, alias="EDITALOS_DB_URL")
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_text_model: str = Field(default="gpt-5.4", alias="OPENAI_TEXT_MODEL")

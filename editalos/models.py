@@ -96,6 +96,7 @@ class Card(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False, index=True)
+    study_session_id: Mapped[int | None] = mapped_column(ForeignKey("study_sessions.id"), nullable=True, index=True)
     front: Mapped[str] = mapped_column(Text, nullable=False)
     back: Mapped[str] = mapped_column(Text, nullable=False)
     algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default=SRSAlgorithm.FSRS.value)
@@ -164,6 +165,7 @@ class StudySession(Base, TimestampMixin):
     fatigue_post: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence_post: Mapped[int | None] = mapped_column(Integer, nullable=True)
     accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    content_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     subject: Mapped[Subject | None] = relationship(back_populates="study_sessions")

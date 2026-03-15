@@ -29,6 +29,7 @@ class TopicCreate(BaseModel):
 
 class CardCreate(BaseModel):
     topic_id: int
+    study_session_id: int | None = None
     front: str
     back: str
     algorithm: SRSAlgorithm = SRSAlgorithm.FSRS
@@ -65,6 +66,7 @@ class StudySessionCreate(BaseModel):
     fatigue_post: int | None = Field(default=None, ge=1, le=5)
     confidence_post: int | None = Field(default=None, ge=1, le=5)
     accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
+    content_summary: str | None = None
     notes: str | None = None
 
 

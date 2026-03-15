@@ -35,6 +35,8 @@ def initialize_database() -> None:
     if not settings.db_url.startswith("sqlite"):
         return
     _ensure_subject_planning_columns()
+    _ensure_study_session_context_columns()
+    _ensure_card_study_session_columns()
 
 
 def _ensure_subject_planning_columns() -> None:
@@ -48,6 +50,40 @@ def _ensure_subject_planning_columns() -> None:
         statements.append("ALTER TABLE subjects ADD COLUMN planned_total_minutes INTEGER")
     if "planned_weekly_minutes" not in columns:
         statements.append("ALTER TABLE subjects ADD COLUMN planned_weekly_minutes INTEGER")
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_study_session_context_columns() -> None:
+    inspector = inspect(engine)
+    if "study_sessions" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("study_sessions")}
+    statements: list[str] = []
+    if "content_summary" not in columns:
+        statements.append("ALTER TABLE study_sessions ADD COLUMN content_summary TEXT")
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_card_study_session_columns() -> None:
+    inspector = inspect(engine)
+    if "cards" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("cards")}
+    statements: list[str] = []
+    if "study_session_id" not in columns:
+        statements.append("ALTER TABLE cards ADD COLUMN study_session_id INTEGER")
     if not statements:
         return
 

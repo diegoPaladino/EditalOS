@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from editalos.enums import ReviewTaskStatus, StudySessionRunStatus
-from editalos.models import ReviewTask, StudySession, StudySessionRun, Subject, Topic, TopicProgress
+from editalos.models import Card, ReviewTask, StudySession, StudySessionRun, Subject, Topic, TopicProgress
 from editalos.services.planner import PlannerService
 
 REVIEW_INTERVAL_DAYS = (1, 7, 15, 30)
@@ -36,14 +36,29 @@ class StudyExecutionService:
         return datetime.now(UTC)
 
     @staticmethod
+    def _normalize_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @staticmethod
+    def to_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @staticmethod
     def day_bounds(reference_date: date) -> tuple[datetime, datetime]:
         start = datetime.combine(reference_date, time.min, tzinfo=UTC)
         end = start + timedelta(days=1)
         return start, end
 
-    @staticmethod
-    def _elapsed_seconds(start: datetime, end: datetime) -> int:
-        return max(int((end - start).total_seconds()), 0)
+    @classmethod
+    def _elapsed_seconds(cls, start: datetime, end: datetime) -> int:
+        normalized_start = cls.to_utc(start)
+        normalized_end = cls.to_utc(end)
+        return max(int((normalized_end - normalized_start).total_seconds()), 0)
 
     def list_study_topics(self) -> list[dict[str, Any]]:
         rows = self.session.execute(
@@ -147,7 +162,7 @@ class StudyExecutionService:
         self.session.flush()
         return run
 
-    def finish_session(self) -> SessionFinishResult:
+    def finish_session(self, *, content_summary: str | None = None) -> SessionFinishResult:
         run = self.get_active_session()
         if run is None:
             raise StudyExecutionError("Nao existe sessao ativa para finalizar.")
@@ -170,6 +185,7 @@ class StudyExecutionService:
             started_at=run.started_at,
             ended_at=now,
             actual_minutes=actual_minutes,
+            content_summary=self._normalize_text(content_summary),
             notes=f"session_run_id={run.id};gross_seconds={gross_seconds};net_seconds={net_seconds}",
         )
         self.session.add(study_session)
@@ -219,6 +235,7 @@ class StudyExecutionService:
         self.sync_review_statuses()
         target_day = today or self.now_utc().date()
         _, day_end = self.day_bounds(target_day)
+        linked_cards = self._linked_card_counts_subquery()
         rows = self.session.execute(
             select(
                 ReviewTask.id,
@@ -226,9 +243,13 @@ class StudyExecutionService:
                 Topic.name.label("topic"),
                 ReviewTask.due_at,
                 ReviewTask.status,
+                StudySession.content_summary.label("content_summary"),
+                func.coalesce(linked_cards.c.linked_cards, 0).label("linked_cards"),
             )
             .join(Topic, Topic.id == ReviewTask.topic_id)
             .join(Subject, Subject.id == Topic.subject_id)
+            .outerjoin(StudySession, StudySession.id == ReviewTask.study_session_id)
+            .outerjoin(linked_cards, linked_cards.c.study_session_id == ReviewTask.study_session_id)
             .where(ReviewTask.status.in_([ReviewTaskStatus.PENDING.value, ReviewTaskStatus.OVERDUE.value]))
             .where(ReviewTask.due_at < day_end)
             .order_by(ReviewTask.due_at, Subject.name, Topic.name)
@@ -237,6 +258,7 @@ class StudyExecutionService:
 
     def list_overdue_reviews(self) -> list[dict[str, Any]]:
         self.sync_review_statuses()
+        linked_cards = self._linked_card_counts_subquery()
         rows = self.session.execute(
             select(
                 ReviewTask.id,
@@ -244,9 +266,13 @@ class StudyExecutionService:
                 Topic.name.label("topic"),
                 ReviewTask.due_at,
                 ReviewTask.status,
+                StudySession.content_summary.label("content_summary"),
+                func.coalesce(linked_cards.c.linked_cards, 0).label("linked_cards"),
             )
             .join(Topic, Topic.id == ReviewTask.topic_id)
             .join(Subject, Subject.id == Topic.subject_id)
+            .outerjoin(StudySession, StudySession.id == ReviewTask.study_session_id)
+            .outerjoin(linked_cards, linked_cards.c.study_session_id == ReviewTask.study_session_id)
             .where(ReviewTask.status == ReviewTaskStatus.OVERDUE.value)
             .order_by(ReviewTask.due_at, Subject.name, Topic.name)
         ).all()
@@ -257,6 +283,7 @@ class StudyExecutionService:
         target_day = today or self.now_utc().date()
         _, day_end = self.day_bounds(target_day)
         future_end = day_end + timedelta(days=max(days_ahead, 1))
+        linked_cards = self._linked_card_counts_subquery()
         rows = self.session.execute(
             select(
                 ReviewTask.id,
@@ -264,9 +291,13 @@ class StudyExecutionService:
                 Topic.name.label("topic"),
                 ReviewTask.due_at,
                 ReviewTask.status,
+                StudySession.content_summary.label("content_summary"),
+                func.coalesce(linked_cards.c.linked_cards, 0).label("linked_cards"),
             )
             .join(Topic, Topic.id == ReviewTask.topic_id)
             .join(Subject, Subject.id == Topic.subject_id)
+            .outerjoin(StudySession, StudySession.id == ReviewTask.study_session_id)
+            .outerjoin(linked_cards, linked_cards.c.study_session_id == ReviewTask.study_session_id)
             .where(ReviewTask.status == ReviewTaskStatus.PENDING.value)
             .where(ReviewTask.due_at >= day_end)
             .where(ReviewTask.due_at < future_end)
@@ -397,6 +428,18 @@ class StudyExecutionService:
         return progress
 
     @staticmethod
+    def _linked_card_counts_subquery():
+        return (
+            select(
+                Card.study_session_id.label("study_session_id"),
+                func.count(Card.id).label("linked_cards"),
+            )
+            .where(Card.study_session_id.is_not(None))
+            .group_by(Card.study_session_id)
+            .subquery()
+        )
+
+    @staticmethod
     def _review_row_to_dict(row: Any) -> dict[str, Any]:
         return {
             "id": int(row.id),
@@ -404,4 +447,6 @@ class StudyExecutionService:
             "topic": str(row.topic),
             "due_at": row.due_at,
             "status": str(row.status),
+            "content_summary": getattr(row, "content_summary", None),
+            "linked_cards": int(getattr(row, "linked_cards", 0) or 0),
         }

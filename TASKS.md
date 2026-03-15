@@ -6,6 +6,7 @@
 - Concluido: sessao de estudo start/pause/resume/finish (Streamlit)
 - Concluido: geracao automatica de revisoes D+1/D+7/D+15/D+30
 - Concluido: painel operacional com revisoes vencidas/proximas e metricas do dia
+- Concluido: primeira release de flashcards no Streamlit com criacao manual e revisao FSRS/SM-2
 
 ## Proximo passo exato
 1. Implementar logs de biohacking no Streamlit (sono, hidratacao, nutricao, exercicio e suplemento), gravando nas tabelas ja existentes e exibindo feedback amigavel de sucesso/erro.

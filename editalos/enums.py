@@ -35,3 +35,15 @@ class EntityType(str, Enum):
     TOPIC = "topic"
     CARD = "card"
     NOTE = "note"
+
+
+class StudySessionRunStatus(str, Enum):
+    IN_PROGRESS = "in_progress"
+    PAUSED = "paused"
+    FINISHED = "finished"
+
+
+class ReviewTaskStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    OVERDUE = "overdue"

@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from editalos.database import Base, engine, get_session
+from editalos.database import get_session, initialize_database
 from editalos.enums import ReviewRating, SRSAlgorithm
 from editalos.models import (
     Card,
@@ -32,11 +32,13 @@ from editalos.schemas import (
     TopicCreate,
 )
 from editalos.services.analytics import AnalyticsService
+from editalos.services.catalog import CatalogService, CatalogServiceError
 from editalos.services.embeddings import EmbeddingService
 from editalos.services.openai_service import OpenAIService
 from editalos.services.pdf_ingest import PDFIngestService
 from editalos.services.planner import PlannerConfig, PlannerService
 from editalos.services.srs import SRSService
+from editalos.services.study_strategy import StudyStrategyError, StudyStrategyService
 from editalos.models import StudySession
 
 
@@ -69,6 +71,20 @@ class CLI:
         p.add_argument("--incidence-estimate", type=float, default=0.5)
         p.add_argument("--difficulty-baseline", type=float, default=0.5)
         p.add_argument("--parent-topic-id", type=int)
+
+        p = sub.add_parser("import-topics")
+        p.add_argument("--subject-id", required=True, type=int)
+        p.add_argument("--path", required=True)
+        p.add_argument("--weight", type=float, default=1.0)
+        p.add_argument("--incidence-estimate", type=float, default=0.5)
+        p.add_argument("--difficulty-baseline", type=float, default=0.5)
+        p.add_argument("--skip-existing", action="store_true")
+
+        p = sub.add_parser("sync-subject-weights")
+        p.add_argument("--path", required=True)
+
+        p = sub.add_parser("sync-subject-time")
+        p.add_argument("--path", required=True)
 
         p = sub.add_parser("add-card")
         p.add_argument("--topic-id", required=True, type=int)
@@ -149,18 +165,27 @@ class CLI:
         p.add_argument("--minutes", type=int, default=240)
         p.add_argument("--exam-date")
 
+        p = sub.add_parser("import-strategy")
+        p.add_argument("--path", required=True)
+        p.add_argument("--name", default="Estrategia de estudo")
+        p.add_argument("--source-label")
+
+        p = sub.add_parser("export-anki")
+        p.add_argument("--path", required=True)
+
         sub.add_parser("analytics")
         return parser
 
     def run(self) -> None:
         args = self.build_parser().parse_args()
+        initialize_database()
         handler = getattr(self, f"cmd_{args.command.replace('-', '_')}")
         handler(args)
 
     @staticmethod
     def cmd_init_db(args: argparse.Namespace) -> None:
         del args
-        Base.metadata.create_all(bind=engine)
+        initialize_database()
         print("Banco inicializado com sucesso.")
 
     @staticmethod
@@ -193,6 +218,64 @@ class CLI:
             session.add(topic)
             session.flush()
             print(f"Tópico criado: id={topic.id} nome={topic.name}")
+
+    @staticmethod
+    def cmd_import_topics(args: argparse.Namespace) -> None:
+        raw_text = Path(args.path).read_text(encoding="utf-8-sig")
+        with get_session() as session:
+            catalog = CatalogService(session)
+            try:
+                result = catalog.import_topics_for_subject(
+                    subject_id=args.subject_id,
+                    raw_text=raw_text,
+                    weight=args.weight,
+                    incidence_estimate=args.incidence_estimate,
+                    difficulty_baseline=args.difficulty_baseline,
+                    skip_existing=args.skip_existing,
+                )
+            except CatalogServiceError as exc:
+                raise SystemExit(str(exc)) from exc
+
+            print(
+                "Importacao concluida: "
+                f"criados={len(result.created_topics)} ignorados={len(result.skipped_names)}"
+            )
+
+    @staticmethod
+    def cmd_sync_subject_weights(args: argparse.Namespace) -> None:
+        raw_text = Path(args.path).read_text(encoding="utf-8-sig")
+        with get_session() as session:
+            catalog = CatalogService(session)
+            try:
+                result = catalog.sync_subject_weights(raw_text=raw_text)
+            except CatalogServiceError as exc:
+                raise SystemExit(str(exc)) from exc
+
+            print(
+                "Sincronizacao de pesos concluida: "
+                f"linhas_validas={result.parsed_entries} atualizadas={len(result.updated_subjects)} "
+                f"nao_encontradas={len(result.missing_names)}"
+            )
+            if result.missing_names:
+                print("Disciplinas nao encontradas:", ", ".join(result.missing_names))
+
+    @staticmethod
+    def cmd_sync_subject_time(args: argparse.Namespace) -> None:
+        raw_text = Path(args.path).read_text(encoding="utf-8-sig")
+        with get_session() as session:
+            catalog = CatalogService(session)
+            try:
+                result = catalog.sync_subject_study_time(raw_text=raw_text)
+            except CatalogServiceError as exc:
+                raise SystemExit(str(exc)) from exc
+
+            print(
+                "Sincronizacao de tempo concluida: "
+                f"linhas_validas={result.parsed_entries} atualizadas={len(result.updated_subjects)} "
+                f"nao_encontradas={len(result.missing_names)}"
+            )
+            if result.missing_names:
+                print("Disciplinas nao encontradas:", ", ".join(result.missing_names))
 
     @staticmethod
     def cmd_add_card(args: argparse.Namespace) -> None:
@@ -252,6 +335,39 @@ class CLI:
             session.add(study)
             session.flush()
             print(f"Sessão registrada: id={study.id} minutos={study.actual_minutes}")
+
+    @staticmethod
+    def cmd_import_strategy(args: argparse.Namespace) -> None:
+        raw_text = Path(args.path).read_text(encoding="utf-8-sig")
+        with get_session() as session:
+            service = StudyStrategyService(session)
+            try:
+                result = service.import_strategy(
+                    name=args.name,
+                    raw_text=raw_text,
+                    source_label=args.source_label or Path(args.path).name,
+                )
+            except StudyStrategyError as exc:
+                raise SystemExit(str(exc)) from exc
+
+            print(
+                "Estrategia importada: "
+                f"id={result.profile.id} atualizados={len(result.updated_subjects)} "
+                f"nao_encontrados={len(result.missing_subjects)}"
+            )
+            if result.missing_subjects:
+                print("Itens nao encontrados:", ", ".join(result.missing_subjects))
+
+    @staticmethod
+    def cmd_export_anki(args: argparse.Namespace) -> None:
+        destination = Path(args.path)
+        with get_session() as session:
+            from editalos.services.flashcards import FlashcardService
+
+            service = FlashcardService(session)
+            exported = service.export_to_anki_tsv()
+            destination.write_text(exported, encoding="utf-8")
+            print(f"Exportacao ANKI gerada: {destination}")
 
     @staticmethod
     def cmd_log_sleep(args: argparse.Namespace) -> None:

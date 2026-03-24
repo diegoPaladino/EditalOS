@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+import calendar
+import json
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import select
 
 from editalos.database import get_session, initialize_database
@@ -12,12 +15,32 @@ from editalos.models import Card, ReviewTask, StudyMaterial, Subject, Topic
 from editalos.services.analytics import AnalyticsService
 from editalos.services.catalog import CatalogService, CatalogServiceError
 from editalos.services.flashcards import FlashcardService, FlashcardServiceError
+from editalos.services.study_strategy import StudyStrategyError, StudyStrategyService
 from editalos.services.study_execution import StudyExecutionError, StudyExecutionService
 
 FLASH_MESSAGE_KEY = "catalog_flash_message"
 FLASHCARD_REVIEW_CARD_KEY = "flashcard_review_card_id"
 FLASHCARD_SHOW_ANSWER_KEY = "flashcard_show_answer"
+FLASHCARD_TOPIC_KEY = "flashcard_topic_select"
+LAST_SYNCED_STUDY_TOPIC_KEY = "last_synced_study_topic_select"
 STUDY_SESSION_CONTEXT_KEY = "study_session_content_summary"
+DASHBOARD_SELECTED_STUDY_DATE_KEY = "dashboard_selected_study_date"
+
+MONTH_NAMES_PT = (
+    "Janeiro",
+    "Fevereiro",
+    "Marco",
+    "Abril",
+    "Maio",
+    "Junho",
+    "Julho",
+    "Agosto",
+    "Setembro",
+    "Outubro",
+    "Novembro",
+    "Dezembro",
+)
+WEEKDAY_LABELS_PT = ("Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom")
 
 
 def _set_flash_message(level: str, text: str) -> None:
@@ -57,7 +80,10 @@ def _format_seconds(total_seconds: int) -> str:
 def _format_datetime(value: datetime | None) -> str:
     if value is None:
         return "-"
-    return value.strftime("%d/%m/%Y %H:%M")
+    localized = StudyExecutionService.to_local(value)
+    if localized is None:
+        return "-"
+    return localized.strftime("%d/%m/%Y %H:%M")
 
 
 def _format_minutes(total_minutes: int | None) -> str:
@@ -67,6 +93,10 @@ def _format_minutes(total_minutes: int | None) -> str:
     if minutes == 0:
         return f"{hours}h"
     return f"{hours}h{minutes:02d}min"
+
+
+def _format_day(value: date) -> str:
+    return value.strftime("%d/%m/%Y")
 
 
 def _status_label(status: str) -> str:
@@ -100,9 +130,293 @@ def _truncate_text(value: str, limit: int = 96) -> str:
     return f"{normalized[: max(limit - 3, 1)].rstrip()}..."
 
 
+def _month_bounds(reference_date: date) -> tuple[date, date]:
+    month_start = reference_date.replace(day=1)
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    month_end = next_month - timedelta(days=1)
+    return month_start, month_end
+
+
+def _previous_month(reference_date: date) -> date:
+    month_start = reference_date.replace(day=1)
+    return (month_start - timedelta(days=1)).replace(day=1)
+
+
+def _next_month(reference_date: date) -> date:
+    month_start = reference_date.replace(day=1)
+    return (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def _study_chart_dataframe(daily_summary: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    if daily_summary.empty:
+        return pd.DataFrame(columns=["date", "hours"])
+    chart_df = daily_summary.tail(days).copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"])
+    return chart_df.set_index("date")[["hours"]]
+
+
+def _study_day_sessions_dataframe(day_detail: dict[str, object]) -> pd.DataFrame:
+    sessions = list(day_detail.get("sessions", []))
+    if not sessions:
+        return pd.DataFrame(columns=["inicio", "fim", "disciplina", "topico", "tempo_liquido", "resumo"])
+
+    return pd.DataFrame(
+        [
+            {
+                "inicio": session["started_at"].strftime("%H:%M"),
+                "fim": session["ended_at"].strftime("%H:%M"),
+                "disciplina": session["subject"],
+                "topico": session["topic"],
+                "tempo_liquido": _format_minutes(int(session["actual_minutes"])),
+                "resumo": session["content_summary"] or "-",
+            }
+            for session in sessions
+        ]
+    )
+
+
+def _study_day_subjects_dataframe(day_detail: dict[str, object]) -> pd.DataFrame:
+    subjects = list(day_detail.get("subjects", []))
+    if not subjects:
+        return pd.DataFrame(columns=["disciplina", "tempo_liquido", "sessoes", "topicos"])
+
+    return pd.DataFrame(
+        [
+            {
+                "disciplina": row["subject"],
+                "tempo_liquido": _format_minutes(int(row["minutes"])),
+                "sessoes": int(row["sessions"]),
+                "topicos": int(row["topics_count"]),
+            }
+            for row in subjects
+        ]
+    )
+
+
+def _render_study_calendar(month_summary: pd.DataFrame, selected_date: date) -> None:
+    st.markdown("##### Calendario mensal")
+    lookup = {
+        row["date"]: {"minutes": int(row["minutes"]), "sessions": int(row["sessions"])}
+        for row in month_summary.to_dict("records")
+    }
+    month_title = f"{MONTH_NAMES_PT[selected_date.month - 1]} / {selected_date.year}"
+
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+    with nav_col1:
+        if st.button("Mes anterior", use_container_width=True, key="study_calendar_prev_month"):
+            st.session_state[DASHBOARD_SELECTED_STUDY_DATE_KEY] = _previous_month(selected_date)
+            _safe_rerun()
+    with nav_col2:
+        st.markdown(f"**{month_title}**")
+    with nav_col3:
+        if st.button("Proximo mes", use_container_width=True, key="study_calendar_next_month"):
+            st.session_state[DASHBOARD_SELECTED_STUDY_DATE_KEY] = _next_month(selected_date)
+            _safe_rerun()
+
+    weekday_columns = st.columns(7)
+    for index, label in enumerate(WEEKDAY_LABELS_PT):
+        weekday_columns[index].caption(label)
+
+    month_matrix = calendar.Calendar(firstweekday=0).monthdatescalendar(selected_date.year, selected_date.month)
+    for week_index, week in enumerate(month_matrix):
+        day_columns = st.columns(7)
+        for day_index, current_day in enumerate(week):
+            with day_columns[day_index]:
+                if current_day.month != selected_date.month:
+                    st.caption(" ")
+                    st.write("")
+                    continue
+
+                day_snapshot = lookup.get(current_day, {"minutes": 0, "sessions": 0})
+                studied_minutes = int(day_snapshot["minutes"])
+                sessions_count = int(day_snapshot["sessions"])
+                st.caption(_format_minutes(studied_minutes))
+                if st.button(
+                    str(current_day.day),
+                    key=f"study_calendar_day_{week_index}_{day_index}_{current_day.isoformat()}",
+                    type="primary" if current_day == selected_date else "secondary",
+                    use_container_width=True,
+                    help=(
+                        f"{_format_day(current_day)} | "
+                        f"Tempo liquido: {_format_minutes(studied_minutes)} | "
+                        f"Sessoes: {sessions_count}"
+                    ),
+                ):
+                    st.session_state[DASHBOARD_SELECTED_STUDY_DATE_KEY] = current_day
+                    _safe_rerun()
+
+
+def _render_study_dashboard(analytics: AnalyticsService) -> None:
+    today = StudyExecutionService.local_today()
+    selected_date = st.session_state.get(DASHBOARD_SELECTED_STUDY_DATE_KEY, today)
+    if isinstance(selected_date, datetime):
+        selected_date = selected_date.date()
+    if not isinstance(selected_date, date):
+        selected_date = today
+
+    overview_summary = analytics.study_daily_summary(days=90, reference_date=today)
+    month_start, month_end = _month_bounds(selected_date)
+    month_summary = analytics.study_daily_summary(start_date=month_start, end_date=month_end)
+    day_detail = analytics.study_day_detail(selected_date)
+
+    today_minutes = int(overview_summary.loc[overview_summary["date"] == today, "minutes"].sum())
+    yesterday = today - timedelta(days=1)
+    yesterday_minutes = int(overview_summary.loc[overview_summary["date"] == yesterday, "minutes"].sum())
+    last_7_days = overview_summary.tail(7)
+    last_30_days = overview_summary.tail(30)
+    best_day_minutes = int(last_30_days["minutes"].max()) if not last_30_days.empty else 0
+    average_7_days = int(round(last_7_days["minutes"].mean())) if not last_7_days.empty else 0
+
+    st.subheader("Dashboard de estudo liquido")
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("Hoje", _format_minutes(today_minutes))
+    metric_col2.metric("Ontem", _format_minutes(yesterday_minutes))
+    metric_col3.metric("Ultimos 7 dias", _format_minutes(int(last_7_days["minutes"].sum())))
+    metric_col4.metric("Media diaria 7d", _format_minutes(average_7_days))
+    st.caption(f"Melhor dia nos ultimos 30 dias: {_format_minutes(best_day_minutes)}.")
+
+    st.markdown("#### Evolucao diaria")
+    chart_df = _study_chart_dataframe(overview_summary, days=30)
+    if chart_df.empty or float(chart_df["hours"].sum()) == 0:
+        st.info("Sem sessoes finalizadas nos ultimos 30 dias.")
+    else:
+        st.bar_chart(chart_df)
+
+    st.markdown("#### Calendario e detalhe do dia")
+    selector_col, focus_col = st.columns([1, 3])
+    with selector_col:
+        new_selected_date = st.date_input(
+            "Dia em foco",
+            value=selected_date,
+            key=DASHBOARD_SELECTED_STUDY_DATE_KEY,
+        )
+        if isinstance(new_selected_date, tuple):
+            new_selected_date = new_selected_date[0]
+        selected_date = new_selected_date if isinstance(new_selected_date, date) else selected_date
+    with focus_col:
+        st.caption(
+            f"Data selecionada: {_format_day(selected_date)} | "
+            f"Tempo liquido: {_format_minutes(int(day_detail['total_minutes']))} | "
+            f"Sessoes: {int(day_detail['sessions_count'])}"
+        )
+
+    dashboard_col1, dashboard_col2 = st.columns([1.25, 1])
+    with dashboard_col1:
+        _render_study_calendar(month_summary, selected_date)
+
+    with dashboard_col2:
+        st.markdown(f"##### Resumo de {_format_day(selected_date)}")
+        detail_col1, detail_col2 = st.columns(2)
+        detail_col1.metric("Tempo liquido", _format_minutes(int(day_detail["total_minutes"])))
+        detail_col2.metric("Sessoes", int(day_detail["sessions_count"]))
+        detail_col3, detail_col4 = st.columns(2)
+        detail_col3.metric("Disciplinas", int(day_detail["subjects_count"]))
+        detail_col4.metric("Topicos", int(day_detail["topics_count"]))
+
+        if day_detail["first_started_at"] is not None and day_detail["last_ended_at"] is not None:
+            st.caption(
+                "Janela do estudo no dia: "
+                f"{day_detail['first_started_at'].strftime('%H:%M')} ate {day_detail['last_ended_at'].strftime('%H:%M')}"
+            )
+
+        subjects_df = _study_day_subjects_dataframe(day_detail)
+        if subjects_df.empty:
+            st.info("Nenhum estudo registrado nesta data.")
+        else:
+            st.markdown("###### Distribuicao por disciplina")
+            st.dataframe(subjects_df, use_container_width=True, hide_index=True)
+
+            st.markdown("###### Sessoes do dia")
+            st.dataframe(_study_day_sessions_dataframe(day_detail), use_container_width=True, hide_index=True)
+
+            summaries = [session["content_summary"] for session in day_detail["sessions"] if session.get("content_summary")]
+            if summaries:
+                st.markdown("###### O que foi estudado")
+                for summary in summaries:
+                    st.caption(f"- {_truncate_text(str(summary), limit=180)}")
+
+
+def _render_live_session_banner(active_snapshot: dict[str, object]) -> None:
+    payload = {
+        "subject": str(active_snapshot["subject"]),
+        "topic": str(active_snapshot["topic"]),
+        "status": str(active_snapshot["status"]),
+        "status_label": _status_label(str(active_snapshot["status"])),
+        "gross_seconds": int(active_snapshot["gross_seconds"]),
+        "net_seconds": int(active_snapshot["net_seconds"]),
+    }
+    components.html(
+        f"""
+        <div id="session-banner" style="
+            background:#102b4c;
+            color:#4ea1ff;
+            padding:16px;
+            border-radius:10px;
+            font-family:sans-serif;
+            font-size:16px;
+            line-height:1.4;
+            border:1px solid rgba(78,161,255,0.18);
+        "></div>
+        <script>
+        const data = {json.dumps(payload, ensure_ascii=True)};
+        const banner = document.getElementById("session-banner");
+        const startedAt = Date.now();
+
+        function formatSeconds(totalSeconds) {{
+            const safe = Math.max(Number(totalSeconds) || 0, 0);
+            const hours = Math.floor(safe / 3600);
+            const minutes = Math.floor((safe % 3600) / 60);
+            const seconds = safe % 60;
+            return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
+        }}
+
+        function render() {{
+            const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+            const gross = data.gross_seconds + elapsed;
+            const net = data.status === "in_progress" ? data.net_seconds + elapsed : data.net_seconds;
+            banner.textContent =
+                `Sessao ativa: ${{data.subject}} / ${{data.topic}} | ` +
+                `Estado: ${{data.status_label}} | ` +
+                `Bruto: ${{formatSeconds(gross)}} | ` +
+                `Liquido: ${{formatSeconds(net)}}`;
+        }}
+
+        render();
+        window.setInterval(render, 1000);
+        </script>
+        """,
+        height=74,
+    )
+
+
+def _render_topic_progress_snapshot(progress_snapshot: dict[str, object] | None) -> None:
+    if progress_snapshot is None:
+        st.caption("Selecione um topico valido para ver o historico acumulado.")
+        return
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("Sessoes no topico", int(progress_snapshot["total_sessions"]))
+    metric_col2.metric("Tempo acumulado", _format_minutes(int(progress_snapshot["total_studied_minutes"])))
+    metric_col3.metric("Revisoes concluidas", int(progress_snapshot["total_reviews_completed"]))
+    metric_col4.metric("Ultimo estudo", _format_datetime(progress_snapshot["last_studied_at"]))
+
+    if progress_snapshot.get("last_content_summary"):
+        st.caption(f"Ultimo contexto registrado: {_truncate_text(str(progress_snapshot['last_content_summary']), limit=160)}")
+
+
 def _clear_flashcard_review_state() -> None:
     st.session_state.pop(FLASHCARD_REVIEW_CARD_KEY, None)
     st.session_state.pop(FLASHCARD_SHOW_ANSWER_KEY, None)
+
+
+def _sync_flashcard_topic_with_study_topic(selected_topic_id: int | None) -> None:
+    if selected_topic_id is None:
+        return
+    last_synced = st.session_state.get(LAST_SYNCED_STUDY_TOPIC_KEY)
+    if last_synced == selected_topic_id:
+        return
+    st.session_state[FLASHCARD_TOPIC_KEY] = int(selected_topic_id)
+    st.session_state[LAST_SYNCED_STUDY_TOPIC_KEY] = int(selected_topic_id)
 
 
 def _current_flashcard(review_queue: list[dict[str, object]]) -> dict[str, object] | None:
@@ -327,6 +641,79 @@ def _render_subject_time_sync_form(catalog: CatalogService, subjects: list[Subje
     return True
 
 
+def _strategy_weekly_minutes_dataframe(summary: dict[str, object] | None) -> pd.DataFrame:
+    if not summary:
+        return pd.DataFrame(columns=["disciplina", "minutos_semana", "carga_semanal"])
+
+    rows = []
+    weekly_minutes = dict(summary.get("weekly_minutes", {}))
+    for subject_name, minutes in sorted(weekly_minutes.items(), key=lambda item: (-int(item[1]), str(item[0]))):
+        rows.append(
+            {
+                "disciplina": str(subject_name),
+                "minutos_semana": int(minutes),
+                "carga_semanal": _format_minutes(int(minutes)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _strategy_presets_dataframe(summary: dict[str, object] | None) -> pd.DataFrame:
+    if not summary:
+        return pd.DataFrame(
+            columns=["preset", "retencao", "intervalo_maximo", "passos", "reaprendizagem", "disciplinas"]
+        )
+
+    rows = []
+    for preset in summary.get("presets", []):
+        rows.append(
+            {
+                "preset": str(preset.get("name") or "-"),
+                "retencao": f"{preset.get('desired_retention')}%" if preset.get("desired_retention") else "-",
+                "intervalo_maximo": (
+                    f"{preset.get('max_interval_min_days')}-{preset.get('max_interval_max_days')} dias"
+                    if preset.get("max_interval_min_days") is not None and preset.get("max_interval_max_days") is not None
+                    else "-"
+                ),
+                "passos": str(preset.get("learning_steps") or "-"),
+                "reaprendizagem": str(preset.get("relearning_steps") or "-"),
+                "disciplinas": ", ".join(preset.get("subjects") or []) or "-",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_study_strategy_form(service: StudyStrategyService) -> bool:
+    with st.form("study_strategy_form", clear_on_submit=False):
+        profile_name = st.text_input("Nome do perfil", value="SEFAZ - Estrategia ANKI")
+        source_label = st.text_input("Origem", value="Estrutura_Anki.txt")
+        raw_text = st.text_area(
+            "Conteudo da estrategia",
+            height=320,
+            placeholder="Cole aqui o conteudo integral do arquivo Estrutura_Anki.txt.",
+        )
+        submitted = st.form_submit_button("Salvar estrategia e aplicar ao planejamento")
+
+    if not submitted:
+        return False
+
+    try:
+        result = service.import_strategy(name=profile_name, raw_text=raw_text, source_label=source_label)
+    except StudyStrategyError as exc:
+        st.error(str(exc))
+        return False
+
+    message = (
+        f"Estrategia ativa: {result.profile.name}. "
+        f"Disciplinas atualizadas: {len(result.updated_subjects)}."
+    )
+    if result.missing_subjects:
+        preview = ", ".join(result.missing_subjects[:5])
+        message += f" Pendencias: {preview}."
+    _set_flash_message("success", message)
+    return True
+
+
 def _render_flashcard_form(
     service: FlashcardService,
     topic_options: list[dict[str, object]],
@@ -336,13 +723,18 @@ def _render_flashcard_form(
         st.info("Cadastre ao menos um topico para habilitar o cadastro de flashcards.")
         return False
 
-    topic_labels = [str(item["label"]) for item in topic_options]
-    topic_by_label = {str(item["label"]): item for item in topic_options}
+    topic_ids = [int(item["id"]) for item in topic_options]
+    topic_by_id = {int(item["id"]): item for item in topic_options}
     session_labels = ["Sem vinculo"] + [str(item["label"]) for item in recent_study_sessions]
     session_by_label = {str(item["label"]): item for item in recent_study_sessions}
 
     with st.form("flashcard_form", clear_on_submit=True):
-        selected_topic = st.selectbox("Topico do flashcard", options=topic_labels)
+        selected_topic_id = st.selectbox(
+            "Topico do flashcard",
+            options=topic_ids,
+            format_func=lambda option: str(topic_by_id[option]["label"]),
+            key=FLASHCARD_TOPIC_KEY,
+        )
         front = st.text_area("Frente", height=120, placeholder="Pergunta, conceito-chave ou gatilho de lembranca.")
         back = st.text_area("Verso", height=160, placeholder="Resposta objetiva e curta.")
         algorithm = st.selectbox(
@@ -357,11 +749,11 @@ def _render_flashcard_form(
     if not submitted:
         return False
 
-    target_topic = topic_by_label[selected_topic]
+    target_topic = topic_by_id[int(selected_topic_id)]
     linked_study_session = None if selected_session == "Sem vinculo" else session_by_label[selected_session]
     try:
         card = service.create_card(
-            topic_id=int(target_topic["id"]),
+            topic_id=int(selected_topic_id),
             study_session_id=None if linked_study_session is None else int(linked_study_session["id"]),
             front=front,
             back=back,
@@ -533,22 +925,14 @@ def _render_study_session_area(
     should_rerun = False
 
     st.markdown("#### Sessao de estudo")
+    feedback_placeholder = st.empty()
+    status_placeholder = st.empty()
     content_summary = st.text_area(
         "O que estudei nesta sessao",
         key=STUDY_SESSION_CONTEXT_KEY,
         height=110,
         placeholder="Ex.: artigo X sobre inferencia textual, tipos de questao, erros e pontos de atencao.",
     )
-    if active_snapshot:
-        st.info(
-            "Sessao ativa: "
-            f"{active_snapshot['subject']} / {active_snapshot['topic']} | "
-            f"Estado: {_status_label(str(active_snapshot['status']))} | "
-            f"Bruto: {_format_seconds(int(active_snapshot['gross_seconds']))} | "
-            f"Liquido: {_format_seconds(int(active_snapshot['net_seconds']))}"
-        )
-    else:
-        st.caption("Nenhuma sessao ativa no momento.")
 
     topic_by_id = {int(item["id"]): item for item in topic_options}
     topic_ids = list(topic_by_id)
@@ -561,16 +945,25 @@ def _render_study_session_area(
             format_func=lambda option: str(topic_by_id[option]["label"]),
             key="study_topic_start",
         )
+        _sync_flashcard_topic_with_study_topic(selected_topic_id)
     else:
         st.warning("Cadastre ao menos um topico para iniciar sessao de estudo.")
+
+    progress_snapshot = (
+        service.topic_progress_snapshot(int(selected_topic_id))
+        if selected_topic_id is not None
+        else None
+    )
+    _render_topic_progress_snapshot(progress_snapshot)
 
     start_disabled = active_snapshot is not None or selected_topic_id is None
     if st.button("Iniciar sessao", disabled=start_disabled, use_container_width=True, key="start_study_session"):
         try:
             started = service.start_session(int(selected_topic_id))
         except StudyExecutionError as exc:
-            st.error(str(exc))
+            feedback_placeholder.error(str(exc))
         else:
+            active_snapshot = service.session_snapshot(started)
             _set_flash_message("success", f"Sessao iniciada com sucesso (id={started.id}).")
             should_rerun = True
 
@@ -585,20 +978,22 @@ def _render_study_session_area(
     with controls[0]:
         if st.button("Pausar", disabled=not can_pause, use_container_width=True, key="pause_study_session"):
             try:
-                service.pause_session()
+                paused = service.pause_session()
             except StudyExecutionError as exc:
-                st.error(str(exc))
+                feedback_placeholder.error(str(exc))
             else:
+                active_snapshot = service.session_snapshot(paused)
                 _set_flash_message("info", "Sessao pausada.")
                 should_rerun = True
 
     with controls[1]:
         if st.button("Retomar", disabled=not can_resume, use_container_width=True, key="resume_study_session"):
             try:
-                service.resume_session()
+                resumed = service.resume_session()
             except StudyExecutionError as exc:
-                st.error(str(exc))
+                feedback_placeholder.error(str(exc))
             else:
+                active_snapshot = service.session_snapshot(resumed)
                 _set_flash_message("info", "Sessao retomada.")
                 should_rerun = True
 
@@ -607,8 +1002,9 @@ def _render_study_session_area(
             try:
                 result = service.finish_session(content_summary=content_summary)
             except StudyExecutionError as exc:
-                st.error(str(exc))
+                feedback_placeholder.error(str(exc))
             else:
+                active_snapshot = None
                 st.session_state.pop(STUDY_SESSION_CONTEXT_KEY, None)
                 _set_flash_message(
                     "success",
@@ -618,6 +1014,12 @@ def _render_study_session_area(
                     f"Revisoes geradas: {result.generated_reviews}",
                 )
                 should_rerun = True
+
+    if active_snapshot:
+        with status_placeholder.container():
+            _render_live_session_banner(active_snapshot)
+    else:
+        status_placeholder.caption("Nenhuma sessao ativa no momento.")
 
     return should_rerun
 
@@ -659,7 +1061,7 @@ def _render_due_reviews_area(service: StudyExecutionService, due_reviews: list[d
 st.set_page_config(page_title="EditalOS", layout="wide")
 _initialize_app()
 st.title("EditalOS")
-st.caption("Planejamento, revisao espacada, analytics e biohacking em ambiente local.")
+st.caption("Planejamento diario, execucao de estudo, integracao com ANKI, analytics e biohacking em ambiente local.")
 
 _render_flash_message()
 
@@ -670,63 +1072,113 @@ with get_session() as session:
     catalog = CatalogService(session)
     study_execution = StudyExecutionService(session)
     flashcards = FlashcardService(session)
+    strategy_service = StudyStrategyService(session)
     subjects = catalog.list_subjects()
     topic_options = study_execution.list_study_topics()
     active_snapshot = study_execution.session_snapshot()
     due_reviews_today = study_execution.list_due_reviews_today()
-    flashcard_metrics = flashcards.review_metrics()
-    flashcard_queue = flashcards.list_review_queue(limit=100)
     flashcard_rows = flashcards.list_cards(limit=200)
-    recent_study_sessions = flashcards.list_recent_study_sessions(limit=100)
+    anki_export_payload = flashcards.export_to_anki_tsv() if flashcard_rows else ""
+    strategy_summary = strategy_service.get_active_summary()
 
     should_rerun = _render_study_session_area(study_execution, topic_options, active_snapshot) or should_rerun
     should_rerun = _render_due_reviews_area(study_execution, due_reviews_today) or should_rerun
 
     st.divider()
-    st.subheader("Flashcards")
-    should_rerun = _render_flashcard_review_area(flashcards, flashcard_queue, flashcard_metrics) or should_rerun
-    flashcard_col1, flashcard_col2 = st.columns(2)
-    with flashcard_col1:
-        st.markdown("#### Cadastro de flashcard")
-        st.caption("Crie cards por topico e use FSRS por padrao para revisao adaptativa.")
-        should_rerun = _render_flashcard_form(flashcards, topic_options, recent_study_sessions) or should_rerun
-    with flashcard_col2:
-        st.markdown("#### Base de flashcards")
-        if flashcard_rows:
-            st.dataframe(_flashcards_dataframe(flashcard_rows), use_container_width=True)
-        else:
-            st.info("Nenhum flashcard cadastrado ainda.")
+    st.subheader("Estrategia ANKI")
+    if strategy_summary:
+        weekday_window = strategy_summary.get("daily_windows", {}).get("weekdays", {})
+        weekend_window = strategy_summary.get("daily_windows", {}).get("weekend", {})
+        strategy_col1, strategy_col2, strategy_col3 = st.columns(3)
+        strategy_col1.metric("Perfil ativo", str(strategy_summary.get("profile_name") or "-"))
+        strategy_col2.metric(
+            "ANKI dias uteis",
+            f"{weekday_window.get('min_minutes', 0)}-{weekday_window.get('max_minutes', 0)} min",
+        )
+        strategy_col3.metric(
+            "ANKI fim de semana",
+            f"{weekend_window.get('min_minutes', 0)}-{weekend_window.get('max_minutes', 0)} min",
+        )
+        st.caption(
+            "Planejamento diario passa a reservar primeiro o bloco de revisao no ANKI e distribui o restante "
+            "entre os topicos do EditalOS."
+        )
+        with st.expander("Ver presets e distribuicao semanal", expanded=False):
+            presets_df = _strategy_presets_dataframe(strategy_summary)
+            weekly_df = _strategy_weekly_minutes_dataframe(strategy_summary)
+            if not presets_df.empty:
+                st.markdown("#### Presets recomendados para o ANKI")
+                st.dataframe(presets_df, use_container_width=True)
+            if not weekly_df.empty:
+                st.markdown("#### Metas semanais por disciplina")
+                st.dataframe(weekly_df, use_container_width=True)
+    else:
+        st.info("Nenhuma estrategia ANKI ativa. Importe o conteudo do arquivo para orientar o planejamento.")
+
+    with st.expander("Importar ou atualizar estrategia ANKI", expanded=strategy_summary is None):
+        st.caption(
+            "Cole o conteudo do arquivo `Estrutura_Anki.txt`. O sistema salva o perfil, atualiza pesos/metas "
+            "de tempo e passa a reservar o bloco diario de revisao externa."
+        )
+        should_rerun = _render_study_strategy_form(strategy_service) or should_rerun
 
     st.divider()
-    st.subheader("Cadastros de apoio")
-    form_col_subject, form_col_topic = st.columns(2)
-    with form_col_subject:
-        st.markdown("#### Cadastro de disciplina")
-        should_rerun = _render_subject_form(catalog) or should_rerun
-    with form_col_topic:
-        st.markdown("#### Cadastro de topico")
-        should_rerun = _render_topic_form(catalog, subjects) or should_rerun
-    st.markdown("#### Importacao de topicos por disciplina")
+    st.subheader("Cards legados para ANKI")
     st.caption(
-        "Aceita um topico por linha, uma secao Markdown com bullets ou um CSV com cabecalho "
-        "`Disciplina,Topico`."
+        "A revisao de flashcards saiu da rotina principal do EditalOS. Os cards existentes ficam aqui apenas "
+        "como base legada para exportacao."
     )
-    should_rerun = _render_topic_import_form(catalog, subjects) or should_rerun
+    if flashcard_rows:
+        st.download_button(
+            "Baixar TSV para importar no ANKI",
+            data=anki_export_payload.encode("utf-8"),
+            file_name=f"editalos_anki_export_{datetime.now().strftime('%Y%m%d_%H%M')}.tsv",
+            mime="text/tab-separated-values",
+            use_container_width=True,
+        )
+        st.caption(
+            "Importe no ANKI como arquivo separado por tabulacao. Os campos exportados sao: frente, verso, tags, "
+            "disciplina, topico, contexto e id do card."
+        )
+        st.dataframe(_flashcards_dataframe(flashcard_rows), use_container_width=True)
+    else:
+        st.info("Nenhum flashcard legado cadastrado ainda.")
 
-    sync_col_weight, sync_col_time = st.columns(2)
-    with sync_col_weight:
-        st.markdown("#### Sincronizacao de pesos")
-        st.caption("Atualiza `weight` e, quando detectado, a quantidade de questoes das disciplinas ja cadastradas.")
-        should_rerun = _render_subject_weight_sync_form(catalog, subjects) or should_rerun
-    with sync_col_time:
-        st.markdown("#### Sincronizacao de tempo")
-        st.caption("Atualiza as metas totais e semanais de tempo por disciplina a partir do texto da LLM.")
-        should_rerun = _render_subject_time_sync_form(catalog, subjects) or should_rerun
+    st.divider()
+    with st.expander("Configuracao inicial e manutencao", expanded=False):
+        st.subheader("Cadastros de apoio")
+        form_col_subject, form_col_topic = st.columns(2)
+        with form_col_subject:
+            st.markdown("#### Cadastro de disciplina")
+            should_rerun = _render_subject_form(catalog) or should_rerun
+        with form_col_topic:
+            st.markdown("#### Cadastro de topico")
+            should_rerun = _render_topic_form(catalog, subjects) or should_rerun
+
+        st.markdown("#### Importacao de topicos por disciplina")
+        st.caption(
+            "Aceita um topico por linha, uma secao Markdown com bullets ou um CSV com cabecalho "
+            "`Disciplina,Topico`."
+        )
+        should_rerun = _render_topic_import_form(catalog, subjects) or should_rerun
+
+        sync_col_weight, sync_col_time = st.columns(2)
+        with sync_col_weight:
+            st.markdown("#### Sincronizacao de pesos")
+            st.caption(
+                "Atualiza `weight` e, quando detectado, a quantidade de questoes das disciplinas ja cadastradas."
+            )
+            should_rerun = _render_subject_weight_sync_form(catalog, subjects) or should_rerun
+        with sync_col_time:
+            st.markdown("#### Sincronizacao de tempo")
+            st.caption("Atualiza as metas totais e semanais de tempo por disciplina a partir do texto da LLM.")
+            should_rerun = _render_subject_time_sync_form(catalog, subjects) or should_rerun
 
 st.divider()
 
 with get_session() as session:
     study_execution = StudyExecutionService(session)
+    strategy_service = StudyStrategyService(session)
     operational_metrics = study_execution.today_operational_metrics()
     overdue_reviews = study_execution.list_overdue_reviews()
     upcoming_reviews = study_execution.list_upcoming_reviews(days_ahead=30)
@@ -740,7 +1192,26 @@ with get_session() as session:
 
     st.markdown("#### O que estudar hoje")
     minutes = st.slider("Minutos totais de estudo", min_value=60, max_value=720, value=240, step=30)
-    study_plan = study_execution.today_study_plan(total_minutes=minutes)
+    guidance = strategy_service.build_daily_guidance(
+        total_minutes=minutes,
+        reference_date=StudyExecutionService.local_today(),
+    )
+    if guidance["has_strategy"]:
+        plan_col1, plan_col2, plan_col3 = st.columns(3)
+        plan_col1.metric("Bloco ANKI hoje", f"{guidance['anki_minutes_target']} min")
+        plan_col2.metric(
+            "Faixa recomendada",
+            f"{guidance['anki_minutes_min']}-{guidance['anki_minutes_max']} min",
+        )
+        plan_col3.metric("Minutos para estudo novo", guidance["available_study_minutes"])
+        st.caption(
+            f"Perfil ativo: {guidance['profile_name']}. O plano abaixo ja desconta o tempo reservado ao ANKI "
+            f"para {'fim de semana' if guidance['day_kind'] == 'weekend' else 'dias uteis'}."
+        )
+    else:
+        st.caption("Sem estrategia ANKI ativa. O plano abaixo usa todos os minutos informados.")
+
+    study_plan = study_execution.today_study_plan(total_minutes=guidance["available_study_minutes"])
     if study_plan:
         st.dataframe(pd.DataFrame(study_plan), use_container_width=True)
     else:
@@ -780,22 +1251,25 @@ with get_session() as session:
 
     analytics = AnalyticsService(session)
 
-    st.subheader("Estudo por hora")
-    study_by_hour = analytics.study_by_hour()
-    if not study_by_hour.empty:
-        st.bar_chart(study_by_hour.set_index("hour")["minutes"])
-        st.dataframe(study_by_hour, use_container_width=True)
-    else:
-        st.info("Sem dados de sessoes de estudo.")
+    _render_study_dashboard(analytics)
 
-    st.subheader("Acuracia por disciplina")
-    acc_subject = analytics.accuracy_by_subject()
-    if not acc_subject.empty:
-        chart_df = acc_subject.set_index("subject")[["accuracy"]]
-        st.bar_chart(chart_df)
-        st.dataframe(acc_subject, use_container_width=True)
-    else:
-        st.info("Sem dados de questoes por disciplina.")
+    with st.expander("Analises complementares", expanded=False):
+        st.markdown("#### Estudo por hora")
+        study_by_hour = analytics.study_by_hour()
+        if not study_by_hour.empty:
+            st.bar_chart(study_by_hour.set_index("hour")["minutes"])
+            st.dataframe(study_by_hour, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem dados de sessoes de estudo.")
+
+        st.markdown("#### Acuracia por disciplina")
+        acc_subject = analytics.accuracy_by_subject()
+        if not acc_subject.empty:
+            chart_df = acc_subject.set_index("subject")[["accuracy"]]
+            st.bar_chart(chart_df)
+            st.dataframe(acc_subject, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem dados de questoes por disciplina.")
 
     st.subheader("Topicos cadastrados")
     topics = session.execute(

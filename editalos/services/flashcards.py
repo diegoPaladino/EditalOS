@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 from datetime import UTC, date, datetime, time, timedelta
+from io import StringIO
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -230,8 +232,8 @@ class FlashcardService:
             for row in rows
         ]
 
-    def list_cards(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        rows = self.session.execute(
+    def list_cards(self, *, limit: int | None = 200) -> list[dict[str, Any]]:
+        stmt = (
             select(
                 Card.id,
                 Card.front,
@@ -252,8 +254,10 @@ class FlashcardService:
             .outerjoin(StudySession, StudySession.id == Card.study_session_id)
             .outerjoin(CardScheduleState, CardScheduleState.card_id == Card.id)
             .order_by(Subject.name, Topic.name, Card.created_at.desc(), Card.id.desc())
-            .limit(max(int(limit), 1))
-        ).all()
+        )
+        if limit is not None:
+            stmt = stmt.limit(max(int(limit), 1))
+        rows = self.session.execute(stmt).all()
         return [
             {
                 "id": int(row.id),
@@ -272,6 +276,25 @@ class FlashcardService:
             }
             for row in rows
         ]
+
+    def export_to_anki_tsv(self) -> str:
+        rows = self.list_cards(limit=None)
+        output = StringIO()
+        writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+        writer.writerow(["Front", "Back", "Tags", "Disciplina", "Topico", "Contexto", "CardID"])
+        for row in rows:
+            writer.writerow(
+                [
+                    self._anki_safe_text(str(row["front"])),
+                    self._anki_safe_text(str(row["back"])),
+                    " ".join(row["tags"]) if row.get("tags") else "",
+                    str(row["subject"]),
+                    str(row["topic"]),
+                    self._anki_safe_text(str(row["content_summary"])) if row.get("content_summary") else "",
+                    int(row["id"]),
+                ]
+            )
+        return output.getvalue()
 
     @staticmethod
     def _normalize_tags(tags: str | list[str] | None) -> list[str] | None:
@@ -301,3 +324,8 @@ class FlashcardService:
         if len(normalized) <= limit:
             return normalized
         return f"{normalized[: max(limit - 3, 1)].rstrip()}..."
+
+    @staticmethod
+    def _anki_safe_text(value: str) -> str:
+        normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
+        return "<br>".join(part.strip() for part in normalized.split("\n"))

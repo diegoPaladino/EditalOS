@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     app_name: str = "EditalOS"
     db_url: str = Field(default=DEFAULT_DB_URL, alias="EDITALOS_DB_URL")
+    app_timezone: str = Field(default="America/Sao_Paulo", alias="EDITALOS_APP_TIMEZONE")
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_text_model: str = Field(default="gpt-5.4", alias="OPENAI_TEXT_MODEL")

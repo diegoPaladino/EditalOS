@@ -7,7 +7,8 @@ from math import ceil
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from editalos.models import Card, CardScheduleState, QuestionAttempt, StudySession, Subject, Topic
+from editalos.enums import ReviewTaskStatus
+from editalos.models import QuestionAttempt, ReviewTask, StudySession, Subject, Topic, TopicProgress
 from editalos.schemas import PlannerWeights, TopicPriority
 
 
@@ -89,21 +90,25 @@ class PlannerService:
 
     def _topic_forgetting_risk(self, topic_id: int) -> float:
         now = datetime.now(UTC)
-        due_stmt = (
-            select(func.count(CardScheduleState.id))
-            .join(Card)
-            .where(Card.topic_id == topic_id)
-            .where(CardScheduleState.due_at.is_not(None))
-            .where(CardScheduleState.due_at <= now)
+        due_stmt = select(func.count(ReviewTask.id)).where(
+            ReviewTask.topic_id == topic_id,
+            ReviewTask.status.in_([ReviewTaskStatus.PENDING.value, ReviewTaskStatus.OVERDUE.value]),
+            ReviewTask.due_at <= now,
         )
         due_count = int(self.session.scalar(due_stmt) or 0)
 
-        total_stmt = select(func.count(Card.id)).where(Card.topic_id == topic_id)
+        total_stmt = select(func.count(ReviewTask.id)).where(ReviewTask.topic_id == topic_id)
         total_count = int(self.session.scalar(total_stmt) or 0)
-        if total_count == 0:
+        if total_count > 0:
+            overdue_ratio = due_count / max(total_count, 1)
+            return max(0.6 + overdue_ratio, 0.25)
+
+        progress = self.session.scalars(select(TopicProgress).where(TopicProgress.topic_id == topic_id)).first()
+        if progress is None or progress.last_studied_at is None:
             return 0.6
-        overdue_ratio = due_count / max(total_count, 1)
-        return max(0.5 + overdue_ratio, 0.2)
+
+        days_since_study = max((now - progress.last_studied_at).days, 0)
+        return min(1.4, 0.6 + (days_since_study * 0.04))
 
     def _recent_error_multiplier(self, topic_id: int) -> float:
         since = datetime.now(UTC) - timedelta(days=7)

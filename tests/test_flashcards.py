@@ -112,3 +112,22 @@ def test_create_card_can_link_to_study_session_of_same_topic(session):
     )
 
     assert card.study_session_id == study_session.id
+
+
+def test_export_to_anki_tsv_includes_header_and_html_breaks(session):
+    topic = _seed_topic(session)
+    service = FlashcardService(session)
+    service.create_card(
+        topic_id=topic.id,
+        front="Primeira linha\nSegunda linha",
+        back="Resposta objetiva",
+        algorithm=SRSAlgorithm.FSRS,
+        tags="sql, banco",
+    )
+
+    exported = service.export_to_anki_tsv()
+    lines = exported.strip().splitlines()
+
+    assert lines[0] == "Front\tBack\tTags\tDisciplina\tTopico\tContexto\tCardID"
+    assert "Primeira linha<br>Segunda linha" in lines[1]
+    assert "\tsql banco\t" in lines[1]

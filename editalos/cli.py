@@ -38,6 +38,7 @@ from editalos.services.openai_service import OpenAIService
 from editalos.services.pdf_ingest import PDFIngestService
 from editalos.services.planner import PlannerConfig, PlannerService
 from editalos.services.srs import SRSService
+from editalos.services.study_strategy import StudyStrategyError, StudyStrategyService
 from editalos.models import StudySession
 
 
@@ -163,6 +164,14 @@ class CLI:
         p = sub.add_parser("plan-day")
         p.add_argument("--minutes", type=int, default=240)
         p.add_argument("--exam-date")
+
+        p = sub.add_parser("import-strategy")
+        p.add_argument("--path", required=True)
+        p.add_argument("--name", default="Estrategia de estudo")
+        p.add_argument("--source-label")
+
+        p = sub.add_parser("export-anki")
+        p.add_argument("--path", required=True)
 
         sub.add_parser("analytics")
         return parser
@@ -326,6 +335,39 @@ class CLI:
             session.add(study)
             session.flush()
             print(f"Sessão registrada: id={study.id} minutos={study.actual_minutes}")
+
+    @staticmethod
+    def cmd_import_strategy(args: argparse.Namespace) -> None:
+        raw_text = Path(args.path).read_text(encoding="utf-8-sig")
+        with get_session() as session:
+            service = StudyStrategyService(session)
+            try:
+                result = service.import_strategy(
+                    name=args.name,
+                    raw_text=raw_text,
+                    source_label=args.source_label or Path(args.path).name,
+                )
+            except StudyStrategyError as exc:
+                raise SystemExit(str(exc)) from exc
+
+            print(
+                "Estrategia importada: "
+                f"id={result.profile.id} atualizados={len(result.updated_subjects)} "
+                f"nao_encontrados={len(result.missing_subjects)}"
+            )
+            if result.missing_subjects:
+                print("Itens nao encontrados:", ", ".join(result.missing_subjects))
+
+    @staticmethod
+    def cmd_export_anki(args: argparse.Namespace) -> None:
+        destination = Path(args.path)
+        with get_session() as session:
+            from editalos.services.flashcards import FlashcardService
+
+            service = FlashcardService(session)
+            exported = service.export_to_anki_tsv()
+            destination.write_text(exported, encoding="utf-8")
+            print(f"Exportacao ANKI gerada: {destination}")
 
     @staticmethod
     def cmd_log_sleep(args: argparse.Namespace) -> None:

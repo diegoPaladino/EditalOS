@@ -156,3 +156,54 @@ def test_due_reviews_include_study_context_and_linked_cards(session, monkeypatch
 
     assert review_row["content_summary"] == "Leitura de texto argumentativo e inferencia."
     assert review_row["linked_cards"] == 1
+
+
+def test_due_reviews_today_uses_local_timezone_boundary(session, monkeypatch):
+    topic = _seed_topic(session)
+    service = StudyExecutionService(session)
+
+    reference_time = datetime(2026, 3, 16, 1, 0, tzinfo=UTC)
+    task = ReviewTask(
+        topic_id=topic.id,
+        due_at=datetime(2026, 3, 16, 22, 25, tzinfo=UTC),
+        status=ReviewTaskStatus.PENDING.value,
+    )
+    session.add(task)
+    session.flush()
+
+    monkeypatch.setattr(StudyExecutionService, "now_utc", staticmethod(lambda: reference_time))
+
+    due_today = service.list_due_reviews_today()
+    upcoming = service.list_upcoming_reviews(days_ahead=30)
+
+    assert due_today == []
+    assert len(upcoming) == 1
+    assert upcoming[0]["due_at"].strftime("%d/%m/%Y %H:%M") == "16/03/2026 19:25"
+
+
+def test_topic_progress_snapshot_returns_accumulated_metrics(session, monkeypatch):
+    topic = _seed_topic(session)
+    service = StudyExecutionService(session)
+
+    base = datetime(2026, 3, 10, 12, 0, tzinfo=UTC)
+    timeline = iter(
+        [
+            base,
+            base + timedelta(minutes=20),
+            base + timedelta(hours=2),
+            base + timedelta(hours=2, minutes=15),
+        ]
+    )
+    monkeypatch.setattr(StudyExecutionService, "now_utc", staticmethod(lambda: next(timeline)))
+
+    service.start_session(topic.id)
+    service.finish_session(content_summary="Primeira leitura.")
+    service.start_session(topic.id)
+    service.finish_session(content_summary="Segunda leitura.")
+
+    snapshot = service.topic_progress_snapshot(topic.id)
+
+    assert snapshot is not None
+    assert snapshot["total_sessions"] == 2
+    assert snapshot["total_studied_minutes"] == 35
+    assert snapshot["last_content_summary"] == "Segunda leitura."

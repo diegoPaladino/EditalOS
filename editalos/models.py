@@ -307,6 +307,17 @@ class DailyMetricSnapshot(Base, TimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class StudyStrategyProfile(Base, TimestampMixin):
+    __tablename__ = "study_strategy_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+
+
 class EmbeddingVector(Base, TimestampMixin):
     __tablename__ = "embedding_vectors"
 

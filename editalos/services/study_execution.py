@@ -3,15 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from editalos.config import get_settings
 from editalos.enums import ReviewTaskStatus, StudySessionRunStatus
 from editalos.models import Card, ReviewTask, StudySession, StudySessionRun, Subject, Topic, TopicProgress
 from editalos.services.planner import PlannerService
 
 REVIEW_INTERVAL_DAYS = (1, 7, 15, 30)
+settings = get_settings()
 
 
 class StudyExecutionError(Exception):
@@ -43,16 +46,31 @@ class StudyExecutionService:
         return normalized or None
 
     @staticmethod
+    def local_timezone() -> ZoneInfo:
+        return ZoneInfo(settings.app_timezone)
+
+    @staticmethod
     def to_utc(value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
 
-    @staticmethod
-    def day_bounds(reference_date: date) -> tuple[datetime, datetime]:
-        start = datetime.combine(reference_date, time.min, tzinfo=UTC)
-        end = start + timedelta(days=1)
-        return start, end
+    @classmethod
+    def to_local(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return cls.to_utc(value).astimezone(cls.local_timezone())
+
+    @classmethod
+    def local_today(cls, reference_time: datetime | None = None) -> date:
+        current = cls.to_utc(reference_time or cls.now_utc())
+        return current.astimezone(cls.local_timezone()).date()
+
+    @classmethod
+    def day_bounds(cls, reference_date: date) -> tuple[datetime, datetime]:
+        start_local = datetime.combine(reference_date, time.min, tzinfo=cls.local_timezone())
+        end_local = start_local + timedelta(days=1)
+        return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
     @classmethod
     def _elapsed_seconds(cls, start: datetime, end: datetime) -> int:
@@ -76,6 +94,40 @@ class StudyExecutionService:
             }
             for row in rows
         ]
+
+    def topic_progress_snapshot(self, topic_id: int) -> dict[str, Any] | None:
+        topic_row = self.session.execute(
+            select(Topic.id, Topic.name.label("topic"), Subject.name.label("subject"))
+            .join(Subject, Subject.id == Topic.subject_id)
+            .where(Topic.id == topic_id)
+        ).first()
+        if topic_row is None:
+            return None
+
+        progress = self.session.scalars(select(TopicProgress).where(TopicProgress.topic_id == topic_id)).first()
+        latest_session = self.session.scalars(
+            select(StudySession)
+            .where(StudySession.topic_id == topic_id)
+            .order_by(StudySession.started_at.desc(), StudySession.id.desc())
+        ).first()
+
+        total_sessions = int(progress.total_sessions) if progress is not None else 0
+        total_net_seconds = int(progress.total_net_seconds) if progress is not None else 0
+        total_gross_seconds = int(progress.total_gross_seconds) if progress is not None else 0
+        total_reviews_completed = int(progress.total_reviews_completed) if progress is not None else 0
+        return {
+            "topic_id": int(topic_row.id),
+            "subject": str(topic_row.subject),
+            "topic": str(topic_row.topic),
+            "total_sessions": total_sessions,
+            "total_net_seconds": total_net_seconds,
+            "total_gross_seconds": total_gross_seconds,
+            "total_studied_minutes": total_net_seconds // 60,
+            "total_reviews_completed": total_reviews_completed,
+            "last_studied_at": self.to_local(progress.last_studied_at) if progress is not None else None,
+            "last_review_completed_at": self.to_local(progress.last_review_completed_at) if progress is not None else None,
+            "last_content_summary": latest_session.content_summary if latest_session is not None else None,
+        }
 
     def get_active_session(self) -> StudySessionRun | None:
         return self.session.scalars(
@@ -233,7 +285,7 @@ class StudyExecutionService:
 
     def list_due_reviews_today(self, today: date | None = None) -> list[dict[str, Any]]:
         self.sync_review_statuses()
-        target_day = today or self.now_utc().date()
+        target_day = today or self.local_today()
         _, day_end = self.day_bounds(target_day)
         linked_cards = self._linked_card_counts_subquery()
         rows = self.session.execute(
@@ -280,7 +332,7 @@ class StudyExecutionService:
 
     def list_upcoming_reviews(self, days_ahead: int = 30, today: date | None = None) -> list[dict[str, Any]]:
         self.sync_review_statuses()
-        target_day = today or self.now_utc().date()
+        target_day = today or self.local_today()
         _, day_end = self.day_bounds(target_day)
         future_end = day_end + timedelta(days=max(days_ahead, 1))
         linked_cards = self._linked_card_counts_subquery()
@@ -320,7 +372,7 @@ class StudyExecutionService:
         return task
 
     def today_operational_metrics(self, today: date | None = None) -> dict[str, int]:
-        target_day = today or self.now_utc().date()
+        target_day = today or self.local_today()
         start, end = self.day_bounds(target_day)
         studied_minutes = int(
             self.session.scalar(
@@ -445,7 +497,7 @@ class StudyExecutionService:
             "id": int(row.id),
             "subject": str(row.subject),
             "topic": str(row.topic),
-            "due_at": row.due_at,
+            "due_at": StudyExecutionService.to_local(row.due_at),
             "status": str(row.status),
             "content_summary": getattr(row, "content_summary", None),
             "linked_cards": int(getattr(row, "linked_cards", 0) or 0),
